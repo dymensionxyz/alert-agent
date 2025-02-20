@@ -2,11 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"math/big"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -59,10 +61,16 @@ type Balance struct {
 	Amount string `json:"amount"`
 }
 
-func loadConfig() (*Config, error) {
-	viper.SetConfigName("config")
-	viper.SetConfigType("yaml")
-	viper.AddConfigPath(".")
+func loadConfig(configPath string) (*Config, error) {
+	if configPath != "" {
+		// If a config path is provided, use it directly
+		viper.SetConfigFile(configPath)
+	} else {
+		// Default behavior: look for config.yaml in the current directory
+		viper.SetConfigName("config")
+		viper.SetConfigType("yaml")
+		viper.AddConfigPath(".")
+	}
 
 	if err := viper.ReadInConfig(); err != nil {
 		return nil, fmt.Errorf("error reading config file: %w", err)
@@ -334,7 +342,21 @@ func monitorAddress(addrConfig *AddressConfig, bot *tgbotapi.BotAPI, chatID int6
 }
 
 func main() {
-	config, err := loadConfig()
+	// Parse command line flags
+	configPath := flag.String("config-path", "", "Path to the config file (default: ./config.yaml)")
+	flag.Parse()
+
+	// If a relative path is provided, convert it to absolute
+	if *configPath != "" && !filepath.IsAbs(*configPath) {
+		abs, err := filepath.Abs(*configPath)
+		if err != nil {
+			fmt.Printf("Error resolving config path: %v\n", err)
+			os.Exit(1)
+		}
+		*configPath = abs
+	}
+
+	config, err := loadConfig(*configPath)
 	if err != nil {
 		fmt.Printf("Error loading config: %v\n", err)
 		os.Exit(1)
