@@ -11,9 +11,10 @@ import (
 	"sync"
 	"time"
 
+	"strconv"
+
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/spf13/viper"
-	"strconv"
 )
 
 type AddressConfig struct {
@@ -172,9 +173,9 @@ func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int6
 	if err != nil {
 		fmt.Printf("Error getting metric %s: %v\n", metricConfig.Metric, err)
 	} else if value >= float64(metricConfig.Threshold) {
-		msg := fmt.Sprintf("⚠️ Alert for %s\nMetric %s has exceeded threshold: %.2f >= %d", 
+		msg := fmt.Sprintf("⚠️ Alert for %s\nMetric %s has exceeded threshold: %.2f >= %d",
 			metricConfig.Name, metricConfig.Metric, value, metricConfig.Threshold)
-		
+
 		if bot != nil {
 			tgMsg := tgbotapi.NewMessage(chatID, msg)
 			_, err := bot.Send(tgMsg)
@@ -184,7 +185,7 @@ func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int6
 		} else {
 			fmt.Println(msg)
 		}
-		
+
 		metricConfig.lastAlertTime = time.Now()
 	}
 
@@ -198,9 +199,9 @@ func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int6
 		} else if value >= float64(metricConfig.Threshold) {
 			// Check if enough time has passed since the last alert
 			if time.Since(metricConfig.lastAlertTime) >= time.Duration(globalCooldown)*time.Second {
-				msg := fmt.Sprintf("⚠️ Alert for %s\nMetric %s has exceeded threshold: %.2f >= %d", 
+				msg := fmt.Sprintf("⚠️ Alert for %s\nMetric %s has exceeded threshold: %.2f >= %d",
 					metricConfig.Name, metricConfig.Metric, value, metricConfig.Threshold)
-				
+
 				if bot != nil {
 					tgMsg := tgbotapi.NewMessage(chatID, msg)
 					_, err := bot.Send(tgMsg)
@@ -210,7 +211,7 @@ func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int6
 				} else {
 					fmt.Println(msg)
 				}
-				
+
 				metricConfig.lastAlertTime = time.Now()
 			}
 		}
@@ -305,9 +306,8 @@ func checkAndNotify(addrConfig *AddressConfig, bot *tgbotapi.BotAPI, chatID int6
 func monitorAddress(addrConfig *AddressConfig, bot *tgbotapi.BotAPI, chatID int64, interval time.Duration, globalCooldown int, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	fmt.Printf("Started monitoring %s (%s), you will be alerted if the balance drops below %s %s\n", 
+	fmt.Printf("Started monitoring %s (%s), you will be alerted if the balance drops below %s %s\n",
 		addrConfig.Name, addrConfig.Address, addrConfig.Threshold.Amount, addrConfig.Threshold.Denom)
-	fmt.Printf("Threshold: %s %s\n", addrConfig.Threshold.Amount, addrConfig.Threshold.Denom)
 
 	// Initial check
 	if err := checkAndNotify(addrConfig, bot, chatID, globalCooldown); err != nil {
