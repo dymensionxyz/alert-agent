@@ -215,17 +215,22 @@ func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int6
 			if value >= float64(metricConfig.Threshold) {
 				// Check if enough time has passed since the last alert
 				if time.Since(metricConfig.lastAlertTime) >= time.Duration(globalCooldown)*time.Second {
-					msg := fmt.Sprintf("⚠️ Alert for %s\nMetric `%s` has exceeded threshold: `%.2f` >= `%d`",
+					// Format for stdout
+					stdoutMsg := fmt.Sprintf("[%s] Alert: %s has exceeded threshold! Expected: <= %d, Actual: %.2f",
+						metricConfig.Name, metricConfig.Metric, metricConfig.Threshold, value)
+
+					// Format for Telegram with markdown
+					telegramMsg := fmt.Sprintf("🔴 Alert: `%s` has exceeded threshold!\nMetric: `%s`\nCurrent value: %.2f\nThreshold: %d",
 						metricConfig.Name, metricConfig.Metric, value, metricConfig.Threshold)
 
 					if bot != nil {
-						tgMsg := tgbotapi.NewMessage(chatID, msg)
+						tgMsg := tgbotapi.NewMessage(chatID, telegramMsg)
 						_, err := bot.Send(tgMsg)
 						if err != nil {
 							fmt.Printf("Error sending Telegram message: %v\n", err)
 						}
 					} else {
-						fmt.Println(msg)
+						fmt.Println(stdoutMsg)
 					}
 
 					metricConfig.lastAlertTime = time.Now()
@@ -285,14 +290,14 @@ func checkAndNotify(addrConfig *AddressConfig, bot *tgbotapi.BotAPI, chatID int6
 				}
 
 				// Format for stdout
-				stdoutMsg := fmt.Sprintf("[%s] ⚠️ Alert: %s balance is below threshold! Expected: %s %s, Actual: %s %s",
+				stdoutMsg := fmt.Sprintf("[%s] Alert: %s balance is below threshold! Expected: %s %s, Actual: %s %s",
 					addrConfig.Name,
 					addrConfig.Address,
 					addrConfig.Threshold.Amount, addrConfig.Threshold.Denom,
 					balance.Amount, balance.Denom)
 
 				// Format for Telegram with markdown
-				telegramMsg := fmt.Sprintf("⚠️ Alert: `%s` balance is below threshold!\nAddress: `%s`\nCurrent: %s %s\nThreshold: %s %s",
+				telegramMsg := fmt.Sprintf("📉 Alert: `%s` balance is below threshold!\nAddress: `%s`\nCurrent balance: %s %s\nThreshold: %s %s",
 					addrConfig.Name,
 					addrConfig.Address,
 					balance.Amount, balance.Denom,
