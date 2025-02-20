@@ -22,18 +22,18 @@ BUILD_FLAGS := -ldflags '$(ldflags)' -tags=cgo
 #                                 Make targets                                   #
 # ---------------------------------------------------------------------------- #
 .PHONY: install
-install: go.sum ## Installs the observability-agent binary
+install: go.sum ## Installs the alert-agent binary
 	go install -mod=readonly $(BUILD_FLAGS) .
 
 .PHONY: build
-build: ## Compiles the observability-agent binary
-	go build -o build/observability-agent $(BUILD_FLAGS) .
+build: ## Compiles the alert-agent binary
+	go build -o build/alert-agent $(BUILD_FLAGS) .
 
 ###############################################################################
 ###                                Releasing                                  ###
 ###############################################################################
 
-PACKAGE_NAME:=github.com/dymensionxyz/observability-agent
+PACKAGE_NAME:=github.com/dymensionxyz/alert-agent
 GOLANG_CROSS_VERSION  = v1.23
 GOPATH ?= '$(HOME)/go'
 

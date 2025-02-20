@@ -4,9 +4,9 @@ before:
     - go mod download
 
 builds:
-  - id: "observability-agent-darwin"
+  - id: "alert-agent-darwin"
     main: ./
-    binary: observability-agent
+    binary: alert-agent
     env:
       - CGO_ENABLED=1
       - CC=o64-clang
@@ -21,9 +21,9 @@ builds:
       - -X main.BuildVersion={{.Version}}
       - -X main.BuildCommit={{.Commit}}
       - -X main.BuildTime={{.Date}}
-  - id: "observability-agent-darwin-arm64"
+  - id: "alert-agent-darwin-arm64"
     main: ./
-    binary: observability-agent
+    binary: alert-agent
     env:
       - CGO_ENABLED=1
       - CC=oa64-clang
@@ -38,9 +38,9 @@ builds:
       - -X main.BuildVersion={{.Version}}
       - -X main.BuildCommit={{.Commit}}
       - -X main.BuildTime={{.Date}}
-  - id: "observability-agent-linux"
+  - id: "alert-agent-linux"
     main: ./
-    binary: observability-agent
+    binary: alert-agent
     env:
       - CGO_ENABLED=1
       - CC=gcc
@@ -55,9 +55,9 @@ builds:
       - -X main.BuildVersion={{.Version}}
       - -X main.BuildCommit={{.Commit}}
       - -X main.BuildTime={{.Date}}
-  - id: "observability-agent-linux-arm64"
+  - id: "alert-agent-linux-arm64"
     main: ./
-    binary: observability-agent
+    binary: alert-agent
     env:
       - CGO_ENABLED=1
       - CC=aarch64-linux-gnu-gcc
@@ -70,9 +70,9 @@ builds:
       - -tags=cgo
     ldflags:
       - -X main.BuildVersion={{.Version}} -X main.BuildCommit={{.Commit}} -X main.BuildTime={{.Date}}
-  - id: "observability-agent-windows"
+  - id: "alert-agent-windows"
     main: ./
-    binary: observability-agent
+    binary: alert-agent
     env:
       - CGO_ENABLED=1
       - CC=x86_64-w64-mingw32-gcc
@@ -90,28 +90,28 @@ builds:
       - -X main.BuildTime={{.Date}}
 
 archives:
-  - name_template: '{{ .ProjectName }}_{{- title .Os }}_{{ .Arch }}'
+  - name_template: "{{ .ProjectName }}_{{- title .Os }}_{{ .Arch }}"
     format_overrides:
       - goos: windows
         format: zip
     builds:
-      - observability-agent-darwin
-      - observability-agent-darwin-arm64
-      - observability-agent-windows
-      - observability-agent-linux
-      - observability-agent-linux-arm64
+      - alert-agent-darwin
+      - alert-agent-darwin-arm64
+      - alert-agent-windows
+      - alert-agent-linux
+      - alert-agent-linux-arm64
 
 checksum:
-  name_template: 'checksums.txt'
+  name_template: "checksums.txt"
 
 changelog:
   sort: asc
   filters:
     exclude:
-      - '^chore:'
-      - '^docs:'
-      - '^test:'
-      - '^ci:'
+      - "^chore:"
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
 
 snapshot:
   name_template: "{{ .Tag }}-next"
