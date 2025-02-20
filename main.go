@@ -88,21 +88,16 @@ func loadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("error unmarshaling config: %w", err)
 	}
 
-	// Validate required fields
-	if len(config.Addresses) == 0 {
-		return nil, fmt.Errorf("at least one address configuration is required")
-	}
-
 	// Only validate Telegram config if bot token is provided
 	if config.Telegram.BotToken != "" && config.Telegram.ChatID == 0 {
 		return nil, fmt.Errorf("telegram chat ID is required when bot token is provided")
 	}
 
 	if config.CheckInterval == 0 {
-		config.CheckInterval = 600 // Default to 60 seconds if not specified
+		config.CheckInterval = 600 // Default to 600 seconds if not specified
 	}
 
-	// Validate each address configuration
+	// Validate each address configuration if any are provided
 	for i, addr := range config.Addresses {
 		if addr.Address == "" {
 			return nil, fmt.Errorf("address is required for config #%d", i+1)
@@ -408,14 +403,26 @@ func main() {
 	fmt.Printf("Starting monitor...\n")
 	fmt.Printf("Check interval: %d seconds\n", config.CheckInterval)
 
-	fmt.Println("Monitoring addresses:")
-	for _, addr := range config.Addresses {
-		fmt.Printf("- %s (%s)\n", addr.Name, addr.Address)
+	// Only show addresses section if we have addresses to monitor
+	if len(config.Addresses) > 0 {
+		fmt.Println("\nMonitoring addresses:")
+		for _, addr := range config.Addresses {
+			fmt.Printf("- %s (%s)\n", addr.Name, addr.Address)
+		}
 	}
 
-	fmt.Println("\nMonitoring metrics:")
-	for _, metric := range config.Metrics {
-		fmt.Printf("- %s (%s)\n", metric.Name, metric.Metric)
+	// Only show metrics section if we have metrics to monitor
+	if len(config.Metrics) > 0 {
+		fmt.Println("\nMonitoring metrics:")
+		for _, metric := range config.Metrics {
+			fmt.Printf("- %s (%s)\n", metric.Name, metric.Metric)
+		}
+	}
+
+	// Exit if there's nothing to monitor
+	if len(config.Addresses) == 0 && len(config.Metrics) == 0 {
+		fmt.Println("\nError: No addresses or metrics configured to monitor. Please add at least one address or metric to your config.")
+		os.Exit(1)
 	}
 
 	var wg sync.WaitGroup
