@@ -225,6 +225,7 @@ func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int6
 
 					if bot != nil {
 						tgMsg := tgbotapi.NewMessage(chatID, telegramMsg)
+						tgMsg.ParseMode = tgbotapi.ModeMarkdown
 						_, err := bot.Send(tgMsg)
 						if err != nil {
 							fmt.Printf("Error sending Telegram message: %v\n", err)
@@ -306,7 +307,7 @@ func checkAndNotify(addrConfig *AddressConfig, bot *tgbotapi.BotAPI, chatID int6
 				// Only send Telegram message if bot is configured
 				if bot != nil {
 					msg := tgbotapi.NewMessage(chatID, telegramMsg)
-					msg.ParseMode = "Markdown"
+					msg.ParseMode = tgbotapi.ModeMarkdown
 					if _, err := bot.Send(msg); err != nil {
 						// Log the Telegram error but don't stop monitoring
 						fmt.Printf("Warning: Failed to send Telegram message: %v\n", err)
