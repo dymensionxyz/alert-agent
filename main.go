@@ -19,6 +19,13 @@ import (
 	"github.com/spf13/viper"
 )
 
+// Build information, populated during build
+var (
+	BuildVersion = "dev"
+	BuildCommit  = "none"
+	BuildTime    = "unknown"
+)
+
 type AddressConfig struct {
 	Name          string `mapstructure:"name"`
 	RESTEndpoint  string `mapstructure:"rest_endpoint"`
