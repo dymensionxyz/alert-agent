@@ -168,25 +168,31 @@ func getMetricValue(endpoint, metricName string) (float64, error) {
 func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int64, interval time.Duration, globalCooldown int, wg *sync.WaitGroup) {
 	defer wg.Done()
 
+	fmt.Printf("Started monitoring metric %s (%s), you will be alerted if the value exceeds %d\n",
+		metricConfig.Name, metricConfig.Metric, metricConfig.Threshold)
+
 	// Initial check
 	value, err := getMetricValue(metricConfig.RESTEndpoint, metricConfig.Metric)
 	if err != nil {
 		fmt.Printf("Error getting metric %s: %v\n", metricConfig.Metric, err)
-	} else if value >= float64(metricConfig.Threshold) {
-		msg := fmt.Sprintf("⚠️ Alert for %s\nMetric %s has exceeded threshold: %.2f >= %d",
-			metricConfig.Name, metricConfig.Metric, value, metricConfig.Threshold)
+	} else {
+		fmt.Printf("[%s] %s: %.2f (Threshold: %d)\n", metricConfig.Name, metricConfig.Metric, value, metricConfig.Threshold)
+		if value >= float64(metricConfig.Threshold) {
+			msg := fmt.Sprintf("⚠️ Alert for %s\nMetric `%s` has exceeded threshold: `%.2f` >= `%d`",
+				metricConfig.Name, metricConfig.Metric, value, metricConfig.Threshold)
 
-		if bot != nil {
-			tgMsg := tgbotapi.NewMessage(chatID, msg)
-			_, err := bot.Send(tgMsg)
-			if err != nil {
-				fmt.Printf("Error sending Telegram message: %v\n", err)
+			if bot != nil {
+				tgMsg := tgbotapi.NewMessage(chatID, msg)
+				_, err := bot.Send(tgMsg)
+				if err != nil {
+					fmt.Printf("Error sending Telegram message: %v\n", err)
+				}
+			} else {
+				fmt.Println(msg)
 			}
-		} else {
-			fmt.Println(msg)
-		}
 
-		metricConfig.lastAlertTime = time.Now()
+			metricConfig.lastAlertTime = time.Now()
+		}
 	}
 
 	ticker := time.NewTicker(interval)
@@ -196,23 +202,26 @@ func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int6
 		value, err := getMetricValue(metricConfig.RESTEndpoint, metricConfig.Metric)
 		if err != nil {
 			fmt.Printf("Error getting metric %s: %v\n", metricConfig.Metric, err)
-		} else if value >= float64(metricConfig.Threshold) {
-			// Check if enough time has passed since the last alert
-			if time.Since(metricConfig.lastAlertTime) >= time.Duration(globalCooldown)*time.Second {
-				msg := fmt.Sprintf("⚠️ Alert for %s\nMetric %s has exceeded threshold: %.2f >= %d",
-					metricConfig.Name, metricConfig.Metric, value, metricConfig.Threshold)
+		} else {
+			fmt.Printf("[%s] %s: %.2f (Threshold: %d)\n", metricConfig.Name, metricConfig.Metric, value, metricConfig.Threshold)
+			if value >= float64(metricConfig.Threshold) {
+				// Check if enough time has passed since the last alert
+				if time.Since(metricConfig.lastAlertTime) >= time.Duration(globalCooldown)*time.Second {
+					msg := fmt.Sprintf("⚠️ Alert for %s\nMetric `%s` has exceeded threshold: `%.2f` >= `%d`",
+						metricConfig.Name, metricConfig.Metric, value, metricConfig.Threshold)
 
-				if bot != nil {
-					tgMsg := tgbotapi.NewMessage(chatID, msg)
-					_, err := bot.Send(tgMsg)
-					if err != nil {
-						fmt.Printf("Error sending Telegram message: %v\n", err)
+					if bot != nil {
+						tgMsg := tgbotapi.NewMessage(chatID, msg)
+						_, err := bot.Send(tgMsg)
+						if err != nil {
+							fmt.Printf("Error sending Telegram message: %v\n", err)
+						}
+					} else {
+						fmt.Println(msg)
 					}
-				} else {
-					fmt.Println(msg)
-				}
 
-				metricConfig.lastAlertTime = time.Now()
+					metricConfig.lastAlertTime = time.Now()
+				}
 			}
 		}
 	}
@@ -357,8 +366,16 @@ func main() {
 
 	fmt.Printf("Starting monitor...\n")
 	fmt.Printf("Check interval: %d seconds\n", config.CheckInterval)
-	fmt.Printf("Monitoring %d metrics\n", len(config.Metrics))
-	fmt.Printf("Monitoring %d addresses\n", len(config.Addresses))
+
+	fmt.Println("Monitoring addresses:")
+	for _, addr := range config.Addresses {
+		fmt.Printf("- %s (%s)\n", addr.Name, addr.Address)
+	}
+
+	fmt.Println("\nMonitoring metrics:")
+	for _, metric := range config.Metrics {
+		fmt.Printf("- %s (%s)\n", metric.Name, metric.Metric)
+	}
 
 	var wg sync.WaitGroup
 	interval := time.Duration(config.CheckInterval) * time.Second
