@@ -26,9 +26,8 @@ var (
 	BuildTime    = "unknown"
 )
 
-type AddressConfig struct {
+type AddressItem struct {
 	Name          string `mapstructure:"name"`
-	RESTEndpoint  string `mapstructure:"rest_endpoint"`
 	Address       string `mapstructure:"address"`
 	AlertCooldown int    `mapstructure:"alert_cooldown"` // Optional per-address cooldown
 	Threshold     struct {
@@ -39,13 +38,24 @@ type AddressConfig struct {
 	lastAlertTime time.Time // Internal tracking, not from config
 }
 
-type MetricConfig struct {
-	Name         string `mapstructure:"name"`
-	RESTEndpoint string `mapstructure:"rest_endpoint"`
-	Metric       string `mapstructure:"metric"`
-	Threshold    int    `mapstructure:"threshold"`
+type AddressConfig struct {
+	Name         string        `mapstructure:"name"`
+	RESTEndpoint string        `mapstructure:"rest_endpoint"`
+	Addresses    []AddressItem `mapstructure:"addresses"`
+}
+
+type MetricItem struct {
+	Name      string `mapstructure:"name"`
+	Metric    string `mapstructure:"metric"`
+	Threshold int    `mapstructure:"threshold"`
 
 	lastAlertTime time.Time // Internal tracking, not from config
+}
+
+type MetricConfig struct {
+	Name         string       `mapstructure:"name"`
+	RESTEndpoint string       `mapstructure:"rest_endpoint"`
+	Metrics      []MetricItem `mapstructure:"metrics"`
 }
 
 type Config struct {
@@ -98,21 +108,28 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 
 	// Validate each address configuration if any are provided
-	for i, addr := range config.Addresses {
-		if addr.Address == "" {
-			return nil, fmt.Errorf("address is required for config #%d", i+1)
+	for i, addrGroup := range config.Addresses {
+		if addrGroup.RESTEndpoint == "" {
+			return nil, fmt.Errorf("REST endpoint is required for address group #%d", i+1)
 		}
-		if addr.RESTEndpoint == "" {
-			return nil, fmt.Errorf("REST endpoint is required for address %s", addr.Address)
+		if addrGroup.Name == "" {
+			config.Addresses[i].Name = fmt.Sprintf("Address Group %d", i+1) // Set default name if not provided
 		}
-		if addr.Threshold.Denom == "" {
-			return nil, fmt.Errorf("threshold denom is required for address %s", addr.Address)
-		}
-		if addr.Threshold.Amount == "" {
-			return nil, fmt.Errorf("threshold amount is required for address %s", addr.Address)
-		}
-		if addr.Name == "" {
-			config.Addresses[i].Name = fmt.Sprintf("Wallet %d", i+1) // Set default name if not provided
+
+		// Validate each address within the group
+		for j, addr := range addrGroup.Addresses {
+			if addr.Address == "" {
+				return nil, fmt.Errorf("address is required for address item #%d in group '%s'", j+1, addrGroup.Name)
+			}
+			if addr.Threshold.Denom == "" {
+				return nil, fmt.Errorf("threshold denom is required for address '%s' in group '%s'", addr.Address, addrGroup.Name)
+			}
+			if addr.Threshold.Amount == "" {
+				return nil, fmt.Errorf("threshold amount is required for address '%s' in group '%s'", addr.Address, addrGroup.Name)
+			}
+			if addr.Name == "" {
+				config.Addresses[i].Addresses[j].Name = fmt.Sprintf("Wallet %d", j+1) // Set default name if not provided
+			}
 		}
 	}
 
@@ -178,36 +195,48 @@ func getMetricValue(endpoint, metricName string) (float64, error) {
 func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int64, interval time.Duration, globalCooldown int, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	fmt.Printf("Started monitoring metric %s (%s), you will be alerted if the value exceeds %d\n",
-		metricConfig.Name, metricConfig.Metric, metricConfig.Threshold)
+	fmt.Printf("Started monitoring metrics group '%s' with %d metrics\n",
+		metricConfig.Name, len(metricConfig.Metrics))
 
-	// Initial check
-	value, err := getMetricValue(metricConfig.RESTEndpoint, metricConfig.Metric)
-	if err != nil {
-		fmt.Printf("Error getting metric %s: %v\n", metricConfig.Metric, err)
-	} else {
-		fmt.Printf("[%s] %s: %.2f (Threshold: %d)\n", metricConfig.Name, metricConfig.Metric, value, metricConfig.Threshold)
-		if value >= float64(metricConfig.Threshold) {
-			// Format for stdout
-			stdoutMsg := fmt.Sprintf("[%s] Alert: %s has exceeded threshold! Expected: <= %d, Actual: %.2f",
-				metricConfig.Name, metricConfig.Metric, metricConfig.Threshold, value)
-
-			// Format for Telegram with markdown
-			telegramMsg := fmt.Sprintf("🔴 Alert: `%s` has exceeded threshold!\nMetric: `%s`\nCurrent value: %.2f\nThreshold: %d",
-				metricConfig.Name, metricConfig.Metric, value, metricConfig.Threshold)
-
-			if bot != nil {
-				tgMsg := tgbotapi.NewMessage(chatID, telegramMsg)
-				tgMsg.ParseMode = tgbotapi.ModeMarkdown
-				_, err := bot.Send(tgMsg)
-				if err != nil {
-					fmt.Printf("Error sending Telegram message: %v\n", err)
-				}
-			} else {
-				fmt.Println(stdoutMsg)
+	// Initial check for each metric
+	for i := range metricConfig.Metrics {
+		metricItem := &metricConfig.Metrics[i]
+		value, err := getMetricValue(metricConfig.RESTEndpoint, metricItem.Metric)
+		if err != nil {
+			fmt.Printf("Error getting metric %s: %v\n", metricItem.Metric, err)
+		} else {
+			// Use metric name if provided, otherwise use the metric identifier
+			displayName := metricItem.Metric
+			if metricItem.Name != "" {
+				displayName = metricItem.Name
 			}
 
-			metricConfig.lastAlertTime = time.Now()
+			fmt.Printf("[%s] %s (%s): %.2f (Threshold: %d)\n",
+				metricConfig.Name, displayName, metricItem.Metric, value, metricItem.Threshold)
+
+			if value >= float64(metricItem.Threshold) {
+				// Format for stdout
+				stdoutMsg := fmt.Sprintf("[%s] %s (%s) is above threshold, expected: %d, got: %.2f",
+					metricConfig.Name, displayName, metricItem.Metric, metricItem.Threshold, value)
+
+				telegramMsg := fmt.Sprintf("🔴 Alert: [%s] %s `%s` is above threshold\nExpected: %d\nGot: %.2f",
+					metricConfig.Name, displayName, metricItem.Metric, metricItem.Threshold, value)
+
+				fmt.Println(telegramMsg)
+
+				if bot != nil {
+					tgMsg := tgbotapi.NewMessage(chatID, telegramMsg)
+					tgMsg.ParseMode = tgbotapi.ModeMarkdown
+					_, err := bot.Send(tgMsg)
+					if err != nil {
+						fmt.Printf("Error sending Telegram message (%s): %v\n", telegramMsg, err)
+					}
+				} else {
+					fmt.Println(stdoutMsg)
+				}
+
+				metricItem.lastAlertTime = time.Now()
+			}
 		}
 	}
 
@@ -215,102 +244,121 @@ func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int6
 	defer ticker.Stop()
 
 	for range ticker.C {
-		value, err := getMetricValue(metricConfig.RESTEndpoint, metricConfig.Metric)
-		if err != nil {
-			fmt.Printf("Error getting metric %s: %v\n", metricConfig.Metric, err)
-		} else {
-			fmt.Printf("[%s] %s: %.2f (Threshold: %d)\n", metricConfig.Name, metricConfig.Metric, value, metricConfig.Threshold)
-			if value >= float64(metricConfig.Threshold) {
-				// Check if enough time has passed since the last alert
-				if time.Since(metricConfig.lastAlertTime) >= time.Duration(globalCooldown)*time.Second {
-					// Format for stdout
-					stdoutMsg := fmt.Sprintf("[%s] Alert: %s has exceeded threshold! Expected: <= %d, Actual: %.2f",
-						metricConfig.Name, metricConfig.Metric, metricConfig.Threshold, value)
+		for i := range metricConfig.Metrics {
+			metricItem := &metricConfig.Metrics[i]
+			value, err := getMetricValue(metricConfig.RESTEndpoint, metricItem.Metric)
+			if err != nil {
+				fmt.Printf("Error getting metric %s: %v\n", metricItem.Metric, err)
+			} else {
+				// Use metric name if provided, otherwise use the metric identifier
+				displayName := metricItem.Metric
+				if metricItem.Name != "" {
+					displayName = metricItem.Name
+				}
 
-					// Format for Telegram with markdown
-					telegramMsg := fmt.Sprintf("🔴 Alert: `%s` has exceeded threshold!\nMetric: `%s`\nCurrent value: %.2f\nThreshold: %d",
-						metricConfig.Name, metricConfig.Metric, value, metricConfig.Threshold)
+				fmt.Printf("[%s] %s (%s): %.2f (Threshold: %d)\n",
+					metricConfig.Name, displayName, metricItem.Metric, value, metricItem.Threshold)
 
-					if bot != nil {
-						tgMsg := tgbotapi.NewMessage(chatID, telegramMsg)
-						tgMsg.ParseMode = tgbotapi.ModeMarkdown
-						_, err := bot.Send(tgMsg)
-						if err != nil {
-							fmt.Printf("Error sending Telegram message: %v\n", err)
+				if value >= float64(metricItem.Threshold) {
+					// Check if enough time has passed since the last alert
+					if time.Since(metricItem.lastAlertTime) >= time.Duration(globalCooldown)*time.Second {
+						// Format for stdout
+						stdoutMsg := fmt.Sprintf("[%s] %s `%s` is above threshold, expected: %d, got: %.2f",
+							metricConfig.Name, displayName, metricItem.Metric, metricItem.Threshold, value)
+
+						telegramMsg := fmt.Sprintf("🔴 Alert: [%s] %s `%s` is above threshold\nExpected: %d\nGot: %.2f",
+							metricConfig.Name, displayName, metricItem.Metric, metricItem.Threshold, value)
+
+						fmt.Println(telegramMsg)
+
+						if bot != nil {
+							tgMsg := tgbotapi.NewMessage(chatID, telegramMsg)
+							tgMsg.ParseMode = tgbotapi.ModeMarkdown
+							_, err := bot.Send(tgMsg)
+							if err != nil {
+								fmt.Printf("Error sending Telegram message (%s): %v\n", telegramMsg, err)
+							}
+						} else {
+							fmt.Println(stdoutMsg)
 						}
-					} else {
-						fmt.Println(stdoutMsg)
-					}
 
-					metricConfig.lastAlertTime = time.Now()
+						metricItem.lastAlertTime = time.Now()
+					}
 				}
 			}
 		}
 	}
 }
 
-func checkAndNotify(addrConfig *AddressConfig, bot *tgbotapi.BotAPI, chatID int64, globalCooldown int) error {
-	balances, err := getBalance(addrConfig.RESTEndpoint, addrConfig.Address)
+func checkAndNotify(addrGroupConfig *AddressConfig, addrItem *AddressItem, bot *tgbotapi.BotAPI, chatID int64, globalCooldown int) error {
+	balances, err := getBalance(addrGroupConfig.RESTEndpoint, addrItem.Address)
 	if err != nil {
-		return fmt.Errorf("error checking %s: %w", addrConfig.Name, err)
+		return fmt.Errorf("error checking %s: %w", addrItem.Name, err)
 	}
 
 	if len(balances.Balances) == 0 {
-		return fmt.Errorf("no balances found for %s (%s)", addrConfig.Name, addrConfig.Address)
+		return fmt.Errorf("no balances found for %s (%s)", addrItem.Name, addrItem.Address)
 	}
 
 	thresholdAmount := new(big.Int)
-	_, ok := thresholdAmount.SetString(addrConfig.Threshold.Amount, 10)
+	_, ok := thresholdAmount.SetString(addrItem.Threshold.Amount, 10)
 	if !ok {
-		return fmt.Errorf("invalid threshold amount for %s: %s", addrConfig.Name, addrConfig.Threshold.Amount)
+		return fmt.Errorf("invalid threshold amount for %s: %s", addrItem.Name, addrItem.Threshold.Amount)
 	}
 
 	// Find the balance for the specified denomination
 	for _, balance := range balances.Balances {
-		if balance.Denom == addrConfig.Threshold.Denom {
+		if balance.Denom == addrItem.Threshold.Denom {
 			currentAmount := new(big.Int)
 			_, ok := currentAmount.SetString(balance.Amount, 10)
 			if !ok {
-				return fmt.Errorf("invalid balance amount for %s: %s", addrConfig.Name, balance.Amount)
+				return fmt.Errorf("invalid balance amount for %s: %s", addrItem.Name, balance.Amount)
 			}
 
 			// Always print to stdout
-			fmt.Printf("[%s] Balance: %s %s (Threshold: %s %s)\n",
-				addrConfig.Name,
+			fmt.Printf("[%s] %s Balance: %s %s (Threshold: %s %s)\n",
+				addrGroupConfig.Name,
+				addrItem.Name,
 				balance.Amount, balance.Denom,
-				addrConfig.Threshold.Amount, addrConfig.Threshold.Denom)
+				addrItem.Threshold.Amount, addrItem.Threshold.Denom)
 
 			if currentAmount.Cmp(thresholdAmount) < 0 {
 				// Check if we're still in cooldown period
 				cooldown := globalCooldown
-				if addrConfig.AlertCooldown > 0 {
-					cooldown = addrConfig.AlertCooldown
+				if addrItem.AlertCooldown > 0 {
+					cooldown = addrItem.AlertCooldown
 				}
 
-				if !addrConfig.lastAlertTime.IsZero() {
-					timeSinceLastAlert := time.Since(addrConfig.lastAlertTime)
+				if !addrItem.lastAlertTime.IsZero() {
+					timeSinceLastAlert := time.Since(addrItem.lastAlertTime)
 					if timeSinceLastAlert < time.Duration(cooldown)*time.Second {
 						// Still in cooldown, just log to stdout
-						fmt.Printf("[%s] Balance still below threshold, but in alert cooldown (%s remaining)\n",
-							addrConfig.Name,
+						fmt.Printf("[%s] %s Balance still below threshold, but in alert cooldown (%s remaining)\n",
+							addrGroupConfig.Name,
+							addrItem.Name,
 							time.Duration(cooldown)*time.Second-timeSinceLastAlert)
 						return nil
 					}
 				}
 
 				// Format for stdout
-				stdoutMsg := fmt.Sprintf("[%s] Alert: %s balance is below threshold! Expected: %s %s, Actual: %s %s",
-					addrConfig.Name,
-					addrConfig.Address,
-					addrConfig.Threshold.Amount, addrConfig.Threshold.Denom,
+				stdoutMsg := fmt.Sprintf("[%s] %s balance is below threshold! Expected: %s %s, Actual: %s %s",
+					addrGroupConfig.Name,
+					addrItem.Name,
+					addrItem.Threshold.Amount, addrItem.Threshold.Denom,
 					balance.Amount, balance.Denom)
 
 				// Format for Telegram with markdown
-				telegramMsg := fmt.Sprintf("📉 Alert: `%s` balance is below threshold!\nAddress: `%s`\nCurrent balance: %s %s\nThreshold: %s %s",
-					addrConfig.Name,
-					addrConfig.Address,
+				// Escape special characters in strings to avoid Markdown parsing issues
+
+				telegramMsg := fmt.Sprintf("📉 Alert: [%s] `%s` balance is below threshold!\nAddress: `%s`\nCurrent balance: %s %s\nThreshold: %s %s",
+					addrGroupConfig.Name,
+					addrItem.Name,
+					addrItem.Address,
 					balance.Amount, balance.Denom,
-					addrConfig.Threshold.Amount, addrConfig.Threshold.Denom)
+					addrItem.Threshold.Amount, addrItem.Threshold.Denom)
+
+				fmt.Println(telegramMsg)
 
 				// Only send Telegram message if bot is configured
 				if bot != nil {
@@ -325,32 +373,38 @@ func checkAndNotify(addrConfig *AddressConfig, bot *tgbotapi.BotAPI, chatID int6
 				fmt.Println(stdoutMsg)
 
 				// Update last alert time
-				addrConfig.lastAlertTime = time.Now()
+				addrItem.lastAlertTime = time.Now()
 			}
 			return nil
 		}
 	}
 
-	return fmt.Errorf("denomination %s not found in balances for %s", addrConfig.Threshold.Denom, addrConfig.Name)
+	return fmt.Errorf("denomination %s not found in balances for %s", addrItem.Threshold.Denom, addrItem.Name)
 }
 
-func monitorAddress(addrConfig *AddressConfig, bot *tgbotapi.BotAPI, chatID int64, interval time.Duration, globalCooldown int, wg *sync.WaitGroup) {
+func monitorAddressGroup(addrGroupConfig *AddressConfig, bot *tgbotapi.BotAPI, chatID int64, interval time.Duration, globalCooldown int, wg *sync.WaitGroup) {
 	defer wg.Done()
 
-	fmt.Printf("Started monitoring %s (%s), you will be alerted if the balance drops below %s %s\n",
-		addrConfig.Name, addrConfig.Address, addrConfig.Threshold.Amount, addrConfig.Threshold.Denom)
+	fmt.Printf("Started monitoring address group '%s' with %d addresses\n",
+		addrGroupConfig.Name, len(addrGroupConfig.Addresses))
 
-	// Initial check
-	if err := checkAndNotify(addrConfig, bot, chatID, globalCooldown); err != nil {
-		fmt.Printf("Error checking %s: %v\n", addrConfig.Name, err)
+	// Initial check for each address
+	for i := range addrGroupConfig.Addresses {
+		addrItem := &addrGroupConfig.Addresses[i]
+		if err := checkAndNotify(addrGroupConfig, addrItem, bot, chatID, globalCooldown); err != nil {
+			fmt.Printf("Error checking %s: %v\n", addrItem.Name, err)
+		}
 	}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for range ticker.C {
-		if err := checkAndNotify(addrConfig, bot, chatID, globalCooldown); err != nil {
-			fmt.Printf("Error checking %s: %v\n", addrConfig.Name, err)
+		for i := range addrGroupConfig.Addresses {
+			addrItem := &addrGroupConfig.Addresses[i]
+			if err := checkAndNotify(addrGroupConfig, addrItem, bot, chatID, globalCooldown); err != nil {
+				fmt.Printf("Error checking %s: %v\n", addrItem.Name, err)
+			}
 		}
 	}
 }
@@ -406,16 +460,27 @@ func main() {
 	// Only show addresses section if we have addresses to monitor
 	if len(config.Addresses) > 0 {
 		fmt.Println("\nMonitoring addresses:")
-		for _, addr := range config.Addresses {
-			fmt.Printf("- %s (%s)\n", addr.Name, addr.Address)
+		for _, addrGroup := range config.Addresses {
+			fmt.Printf("- %s (endpoint: %s)\n", addrGroup.Name, addrGroup.RESTEndpoint)
+			for _, addr := range addrGroup.Addresses {
+				fmt.Printf("  • %s (%s), threshold: %s %s\n",
+					addr.Name, addr.Address, addr.Threshold.Amount, addr.Threshold.Denom)
+			}
 		}
 	}
 
 	// Only show metrics section if we have metrics to monitor
 	if len(config.Metrics) > 0 {
 		fmt.Println("\nMonitoring metrics:")
-		for _, metric := range config.Metrics {
-			fmt.Printf("- %s (%s)\n", metric.Name, metric.Metric)
+		for _, metricGroup := range config.Metrics {
+			fmt.Printf("- %s (endpoint: %s)\n", metricGroup.Name, metricGroup.RESTEndpoint)
+			for _, metric := range metricGroup.Metrics {
+				displayName := metric.Metric
+				if metric.Name != "" {
+					displayName = metric.Name
+				}
+				fmt.Printf("  • %s (%s), threshold: %d\n", displayName, metric.Metric, metric.Threshold)
+			}
 		}
 	}
 
@@ -434,11 +499,11 @@ func main() {
 		go monitorMetric(&config.Metrics[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
 	}
 
-	// Start monitoring each address in parallel
+	// Start monitoring each address group in parallel
 	for i := range config.Addresses {
 		wg.Add(1)
-		// Pass pointer to address config to allow updating lastAlertTime
-		go monitorAddress(&config.Addresses[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
+		// Pass pointer to address group config to allow updating lastAlertTime for each address
+		go monitorAddressGroup(&config.Addresses[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
 	}
 
 	// Wait for all monitoring goroutines
