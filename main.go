@@ -58,11 +58,23 @@ type MetricConfig struct {
 	Metrics      []MetricItem `mapstructure:"metrics"`
 }
 
+type HealthItem struct {
+	Name          string    `mapstructure:"name"`
+	Endpoint      string    `mapstructure:"endpoint"`
+	lastAlertTime time.Time // Internal tracking, not from config
+}
+
+type HealthConfig struct {
+	Name      string       `mapstructure:"name"`
+	Endpoints []HealthItem `mapstructure:"endpoints"`
+}
+
 type Config struct {
 	CheckInterval int             `mapstructure:"check_interval"`
 	AlertCooldown int             `mapstructure:"alert_cooldown"` // Global cooldown setting
 	Metrics       []MetricConfig  `mapstructure:"metrics"`
 	Addresses     []AddressConfig `mapstructure:"addresses"`
+	Health        []HealthConfig  `mapstructure:"health"`
 	Telegram      struct {
 		BotToken string `mapstructure:"bot_token"`
 		ChatID   int64  `mapstructure:"chat_id"`
@@ -76,6 +88,15 @@ type BalanceResponse struct {
 type Balance struct {
 	Denom  string `json:"denom"`
 	Amount string `json:"amount"`
+}
+
+type HealthResponse struct {
+	JSONRPC string `json:"jsonrpc"`
+	Result  struct {
+		IsHealthy bool   `json:"isHealthy"`
+		Error     string `json:"error"`
+	} `json:"result"`
+	ID int `json:"id"`
 }
 
 func loadConfig(configPath string) (*Config, error) {
@@ -190,6 +211,30 @@ func getMetricValue(endpoint, metricName string) (float64, error) {
 	}
 
 	return 0, fmt.Errorf("metric %s not found", metricName)
+}
+
+func checkHealth(endpoint string) (*HealthResponse, error) {
+	resp, err := http.Get(endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error reading response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("health endpoint returned status code %d: %s", resp.StatusCode, string(body))
+	}
+
+	var healthResp HealthResponse
+	if err := json.Unmarshal(body, &healthResp); err != nil {
+		return nil, fmt.Errorf("error parsing health response: %w", err)
+	}
+
+	return &healthResp, nil
 }
 
 func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int64, interval time.Duration, globalCooldown int, wg *sync.WaitGroup) {
@@ -382,6 +427,110 @@ func checkAndNotify(addrGroupConfig *AddressConfig, addrItem *AddressItem, bot *
 	return fmt.Errorf("denomination %s not found in balances for %s", addrItem.Threshold.Denom, addrItem.Name)
 }
 
+func checkAndNotifyHealth(healthConfig *HealthConfig, healthItem *HealthItem, bot *tgbotapi.BotAPI, chatID int64, globalCooldown int) error {
+	healthResp, err := checkHealth(healthItem.Endpoint)
+	if err != nil {
+		// Check if we're still in cooldown period
+		if !healthItem.lastAlertTime.IsZero() {
+			timeSinceLastAlert := time.Since(healthItem.lastAlertTime)
+			if timeSinceLastAlert < time.Duration(globalCooldown)*time.Second {
+				// Still in cooldown, just log to stdout
+				fmt.Printf("[%s] %s health check failed, but in alert cooldown (%s remaining)\n",
+					healthConfig.Name,
+					healthItem.Name,
+					time.Duration(globalCooldown)*time.Second-timeSinceLastAlert)
+				return nil
+			}
+		}
+
+		// Format for stdout
+		stdoutMsg := fmt.Sprintf("[%s] %s health check failed: %v",
+			healthConfig.Name,
+			healthItem.Name, err)
+
+		// Format for Telegram with markdown
+		telegramMsg := fmt.Sprintf("🚨 Alert: [%s] `%s` health check failed!\nEndpoint: `%s`\nError: %v",
+			healthConfig.Name,
+			healthItem.Name,
+			healthItem.Endpoint, err)
+
+		fmt.Println(telegramMsg)
+
+		// Only send Telegram message if bot is configured
+		if bot != nil {
+			msg := tgbotapi.NewMessage(chatID, telegramMsg)
+			msg.ParseMode = tgbotapi.ModeMarkdown
+			if _, err := bot.Send(msg); err != nil {
+				// Log the Telegram error but don't stop monitoring
+				fmt.Printf("Warning: Failed to send Telegram message: %v\n", err)
+			}
+		}
+		// Always print to stdout
+		fmt.Println(stdoutMsg)
+
+		// Update last alert time
+		healthItem.lastAlertTime = time.Now()
+		return nil
+	}
+
+	// Always print to stdout
+	fmt.Printf("[%s] %s Health: %v (Endpoint: %s)\n",
+		healthConfig.Name,
+		healthItem.Name,
+		healthResp.Result.IsHealthy,
+		healthItem.Endpoint)
+
+	// Check if health is not true
+	if !healthResp.Result.IsHealthy {
+		// Check if we're still in cooldown period
+		if !healthItem.lastAlertTime.IsZero() {
+			timeSinceLastAlert := time.Since(healthItem.lastAlertTime)
+			if timeSinceLastAlert < time.Duration(globalCooldown)*time.Second {
+				// Still in cooldown, just log to stdout
+				fmt.Printf("[%s] %s health is unhealthy, but in alert cooldown (%s remaining)\n",
+					healthConfig.Name,
+					healthItem.Name,
+					time.Duration(globalCooldown)*time.Second-timeSinceLastAlert)
+				return nil
+			}
+		}
+
+		// Format for stdout
+		stdoutMsg := fmt.Sprintf("[%s] %s health is unhealthy! isHealthy: %v, error: %s",
+			healthConfig.Name,
+			healthItem.Name,
+			healthResp.Result.IsHealthy,
+			healthResp.Result.Error)
+
+		// Format for Telegram with markdown
+		telegramMsg := fmt.Sprintf("⚠️ Alert: [%s] `%s` health is unhealthy!\nEndpoint: `%s`\nIsHealthy: %v\nError: %s",
+			healthConfig.Name,
+			healthItem.Name,
+			healthItem.Endpoint,
+			healthResp.Result.IsHealthy,
+			healthResp.Result.Error)
+
+		fmt.Println(telegramMsg)
+
+		// Only send Telegram message if bot is configured
+		if bot != nil {
+			msg := tgbotapi.NewMessage(chatID, telegramMsg)
+			msg.ParseMode = tgbotapi.ModeMarkdown
+			if _, err := bot.Send(msg); err != nil {
+				// Log the Telegram error but don't stop monitoring
+				fmt.Printf("Warning: Failed to send Telegram message: %v\n", err)
+			}
+		}
+		// Always print to stdout
+		fmt.Println(stdoutMsg)
+
+		// Update last alert time
+		healthItem.lastAlertTime = time.Now()
+	}
+
+	return nil
+}
+
 func monitorAddressGroup(addrGroupConfig *AddressConfig, bot *tgbotapi.BotAPI, chatID int64, interval time.Duration, globalCooldown int, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -404,6 +553,33 @@ func monitorAddressGroup(addrGroupConfig *AddressConfig, bot *tgbotapi.BotAPI, c
 			addrItem := &addrGroupConfig.Addresses[i]
 			if err := checkAndNotify(addrGroupConfig, addrItem, bot, chatID, globalCooldown); err != nil {
 				fmt.Printf("Error checking %s: %v\n", addrItem.Name, err)
+			}
+		}
+	}
+}
+
+func monitorHealth(healthConfig *HealthConfig, bot *tgbotapi.BotAPI, chatID int64, interval time.Duration, globalCooldown int, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	fmt.Printf("Started monitoring health group '%s' with %d health endpoints\n",
+		healthConfig.Name, len(healthConfig.Endpoints))
+
+	// Initial check for each health endpoint
+	for i := range healthConfig.Endpoints {
+		healthItem := &healthConfig.Endpoints[i]
+		if err := checkAndNotifyHealth(healthConfig, healthItem, bot, chatID, globalCooldown); err != nil {
+			fmt.Printf("Error checking health endpoint %s: %v\n", healthItem.Name, err)
+		}
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		for i := range healthConfig.Endpoints {
+			healthItem := &healthConfig.Endpoints[i]
+			if err := checkAndNotifyHealth(healthConfig, healthItem, bot, chatID, globalCooldown); err != nil {
+				fmt.Printf("Error checking health endpoint %s: %v\n", healthItem.Name, err)
 			}
 		}
 	}
@@ -484,9 +660,20 @@ func main() {
 		}
 	}
 
+	// Only show health section if we have health endpoints to monitor
+	if len(config.Health) > 0 {
+		fmt.Println("\nMonitoring health endpoints:")
+		for _, healthGroup := range config.Health {
+			fmt.Printf("- %s\n", healthGroup.Name)
+			for _, health := range healthGroup.Endpoints {
+				fmt.Printf("  • %s (%s)\n", health.Name, health.Endpoint)
+			}
+		}
+	}
+
 	// Exit if there's nothing to monitor
-	if len(config.Addresses) == 0 && len(config.Metrics) == 0 {
-		fmt.Println("\nError: No addresses or metrics configured to monitor. Please add at least one address or metric to your config.")
+	if len(config.Addresses) == 0 && len(config.Metrics) == 0 && len(config.Health) == 0 {
+		fmt.Println("\nError: No addresses, metrics, or health endpoints configured to monitor. Please add at least one address, metric, or health endpoint to your config.")
 		os.Exit(1)
 	}
 
@@ -504,6 +691,13 @@ func main() {
 		wg.Add(1)
 		// Pass pointer to address group config to allow updating lastAlertTime for each address
 		go monitorAddressGroup(&config.Addresses[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
+	}
+
+	// Start monitoring health groups in parallel
+	for i := range config.Health {
+		wg.Add(1)
+		// Pass pointer to health group config to allow updating lastAlertTime for each health item
+		go monitorHealth(&config.Health[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
 	}
 
 	// Wait for all monitoring goroutines

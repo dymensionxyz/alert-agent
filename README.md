@@ -7,6 +7,7 @@ A Go program that monitors multiple Cosmos account balances across different cha
 - Monitor multiple addresses simultaneously
 - Support for different chains and cosmos compatible REST endpoints
 - Monitor Prometheus metrics with threshold alerts
+- Monitor health endpoints with automatic alerting for unhealthy status or HTTP errors
 - Individual threshold settings for each address and metric
 - Parallel monitoring with efficient resource usage
 - Flexible output options (stdout or Telegram)
@@ -41,6 +42,14 @@ addresses:
       denom: "utia"                        # denomination to check
       amount: "1000000000000000000"        # minimum amount
     alert_cooldown: 7200                   # Optional: override global cooldown for this address (2 hours)
+
+health:
+  - name: "Rollapp Network"                # Human-readable name for the health group
+    endpoints:
+      - name: "Main RPC"                   # Human-readable name for the health endpoint
+        endpoint: "https://rpc.uod.wasm.ra.mn.rollapp.network/health" # Health endpoint URL
+      - name: "Backup RPC"                 # Human-readable name for the health endpoint
+        endpoint: "https://backup-rpc.example.com/health" # Health endpoint URL
 
 telegram:
   bot_token: ""                            # Leave empty to use stdout only
