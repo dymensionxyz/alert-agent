@@ -1,0 +1,42 @@
+check_interval: 600                        # Global check interval in seconds (default: 10 minutes)
+alert_cooldown: 3600                       # Global alert cooldown in seconds (default: 1 hour). When an alert is triggered, the agent will wait for the cooldown to expire before sending another alert.
+
+metrics:
+  - name: "Sequencer Wallet"               # Human-readable name for the metric alert
+    rest_endpoint: "http://localhost:2112/metrics" # Prometheus metrics endpoint
+    metrics:
+      - name: "Failed DA Submissions"      # Human-readable name for the metric
+        metric: "rollapp_consecutive_failed_da_submissions" # Metric name to monitor
+        threshold: 10                      # Alert when metric exceeds this value
+
+addresses:
+  - name: "Sequencer Wallet"               # Human-readable name for the address
+    rest_endpoint: "https://api-dymension.rollapp.network" # not a real endpoint, just an example
+    addresses:
+      - name: "Main Sequencer"             # Human-readable name for the address
+        address: "dym1dshqzh897jpamh67nqph47h5sqgphgcl7lull2" # Cosmos address to monitor
+        threshold:
+          denom: "adym"                    # denomination to check
+          amount: "1000000000000000000"    # minimum amount
+        alert_cooldown: 7200               # Optional: override global cooldown for this address (2 hours)
+
+kaspa_addresses:
+  - name: "Kaspa Wallets"                  # Human-readable name for the Kaspa address group
+    rest_endpoint: "https://api.kaspa.org" # Kaspa REST API endpoint
+    addresses:
+      - name: "Main Kaspa Wallet"          # Human-readable name for the address
+        address: "kaspa:qqkqkzjvr7zwxxmjxjkmxxdwju9kjs6e9u82uh59z07vgaks6gg62v8707g73" # Kaspa address to monitor
+        threshold: "1000000000"            # minimum amount in sompi (1 KAS = 100000000 sompi)
+        alert_cooldown: 7200               # Optional: override global cooldown for this address (2 hours)
+
+health:
+  - name: "Rollapp Network"                # Human-readable name for the health group
+    endpoints:
+      - name: "Main RPC"                   # Human-readable name for the health endpoint
+        endpoint: "https://rpc.uod.wasm.ra.mn.rollapp.network/health" # Health endpoint URL
+      - name: "Backup RPC"                 # Human-readable name for the health endpoint
+        endpoint: "https://backup-rpc.example.com/health" # Health endpoint URL
+
+telegram:
+  bot_token: ""                            # Leave empty to use stdout only
+  chat_id: 0                               # Required only if bot_token is provided

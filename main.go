@@ -38,10 +38,28 @@ type AddressItem struct {
 	lastAlertTime time.Time // Internal tracking, not from config
 }
 
+type KaspaAddressItem struct {
+	Name          string `mapstructure:"name"`
+	Address       string `mapstructure:"address"`
+	AlertCooldown int    `mapstructure:"alert_cooldown"` // Optional per-address cooldown
+	Threshold     string `mapstructure:"threshold"`      // Threshold amount in sompi
+
+	lastAlertTime       time.Time   // Internal tracking, not from config
+	isUnhealthy         bool        // Track if currently in unhealthy state
+	recoveryMonitorStop chan bool   // Channel to stop recovery monitoring
+	recoveryMonitorMu   *sync.Mutex // Pointer to avoid copy issues
+}
+
 type AddressConfig struct {
 	Name         string        `mapstructure:"name"`
 	RESTEndpoint string        `mapstructure:"rest_endpoint"`
 	Addresses    []AddressItem `mapstructure:"addresses"`
+}
+
+type KaspaAddressConfig struct {
+	Name         string             `mapstructure:"name"`
+	RESTEndpoint string             `mapstructure:"rest_endpoint"`
+	Addresses    []KaspaAddressItem `mapstructure:"addresses"`
 }
 
 type MetricItem struct {
@@ -49,7 +67,10 @@ type MetricItem struct {
 	Metric    string `mapstructure:"metric"`
 	Threshold int    `mapstructure:"threshold"`
 
-	lastAlertTime time.Time // Internal tracking, not from config
+	lastAlertTime       time.Time   // Internal tracking, not from config
+	isUnhealthy         bool        // Track if currently in unhealthy state
+	recoveryMonitorStop chan bool   // Channel to stop recovery monitoring
+	recoveryMonitorMu   *sync.Mutex // Pointer to avoid copy issues
 }
 
 type MetricConfig struct {
@@ -59,9 +80,12 @@ type MetricConfig struct {
 }
 
 type HealthItem struct {
-	Name          string    `mapstructure:"name"`
-	Endpoint      string    `mapstructure:"endpoint"`
-	lastAlertTime time.Time // Internal tracking, not from config
+	Name                string      `mapstructure:"name"`
+	Endpoint            string      `mapstructure:"endpoint"`
+	lastAlertTime       time.Time   // Internal tracking, not from config
+	isUnhealthy         bool        // Track if currently in unhealthy state
+	recoveryMonitorStop chan bool   // Channel to stop recovery monitoring
+	recoveryMonitorMu   *sync.Mutex // Pointer to avoid copy issues
 }
 
 type HealthConfig struct {
@@ -70,12 +94,13 @@ type HealthConfig struct {
 }
 
 type Config struct {
-	CheckInterval int             `mapstructure:"check_interval"`
-	AlertCooldown int             `mapstructure:"alert_cooldown"` // Global cooldown setting
-	Metrics       []MetricConfig  `mapstructure:"metrics"`
-	Addresses     []AddressConfig `mapstructure:"addresses"`
-	Health        []HealthConfig  `mapstructure:"health"`
-	Telegram      struct {
+	CheckInterval  int                   `mapstructure:"check_interval"`
+	AlertCooldown  int                   `mapstructure:"alert_cooldown"` // Global cooldown setting
+	Metrics        []MetricConfig        `mapstructure:"metrics"`
+	Addresses      []AddressConfig       `mapstructure:"addresses"`
+	KaspaAddresses []KaspaAddressConfig  `mapstructure:"kaspa_addresses"`
+	Health         []HealthConfig        `mapstructure:"health"`
+	Telegram       struct {
 		BotToken string `mapstructure:"bot_token"`
 		ChatID   int64  `mapstructure:"chat_id"`
 	} `mapstructure:"telegram"`
@@ -88,6 +113,11 @@ type BalanceResponse struct {
 type Balance struct {
 	Denom  string `json:"denom"`
 	Amount string `json:"amount"`
+}
+
+type KaspaBalanceResponse struct {
+	Address string `json:"address"`
+	Balance int64  `json:"balance"`
 }
 
 type HealthResponse struct {
@@ -154,6 +184,43 @@ func loadConfig(configPath string) (*Config, error) {
 		}
 	}
 
+	// Validate each Kaspa address configuration if any are provided
+	for i, kaspaGroup := range config.KaspaAddresses {
+		if kaspaGroup.RESTEndpoint == "" {
+			return nil, fmt.Errorf("REST endpoint is required for Kaspa address group #%d", i+1)
+		}
+		if kaspaGroup.Name == "" {
+			config.KaspaAddresses[i].Name = fmt.Sprintf("Kaspa Address Group %d", i+1) // Set default name if not provided
+		}
+
+		// Validate each Kaspa address within the group
+		for j, addr := range kaspaGroup.Addresses {
+			if addr.Address == "" {
+				return nil, fmt.Errorf("address is required for Kaspa address item #%d in group '%s'", j+1, kaspaGroup.Name)
+			}
+			if addr.Threshold == "" {
+				return nil, fmt.Errorf("threshold is required for Kaspa address '%s' in group '%s'", addr.Address, kaspaGroup.Name)
+			}
+			if addr.Name == "" {
+				config.KaspaAddresses[i].Addresses[j].Name = fmt.Sprintf("Kaspa Wallet %d", j+1) // Set default name if not provided
+			}
+		}
+	}
+
+	// Initialize mutexes for metrics
+	for i := range config.Metrics {
+		for j := range config.Metrics[i].Metrics {
+			config.Metrics[i].Metrics[j].recoveryMonitorMu = &sync.Mutex{}
+		}
+	}
+
+	// Initialize mutexes for health endpoints
+	for i := range config.Health {
+		for j := range config.Health[i].Endpoints {
+			config.Health[i].Endpoints[j].recoveryMonitorMu = &sync.Mutex{}
+		}
+	}
+
 	return &config, nil
 }
 
@@ -176,6 +243,32 @@ func getBalance(restEndpoint, address string) (*BalanceResponse, error) {
 	}
 
 	var balanceResp BalanceResponse
+	if err := json.Unmarshal(body, &balanceResp); err != nil {
+		return nil, fmt.Errorf("error parsing response: %w", err)
+	}
+
+	return &balanceResp, nil
+}
+
+func getKaspaBalance(restEndpoint, address string) (*KaspaBalanceResponse, error) {
+	balanceURL := fmt.Sprintf("%s/addresses/%s/balance", restEndpoint, address)
+
+	resp, err := http.Get(balanceURL)
+	if err != nil {
+		return nil, fmt.Errorf("error making request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("error reading response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API returned status code %d: %s", resp.StatusCode, string(body))
+	}
+
+	var balanceResp KaspaBalanceResponse
 	if err := json.Unmarshal(body, &balanceResp); err != nil {
 		return nil, fmt.Errorf("error parsing response: %w", err)
 	}
@@ -237,6 +330,62 @@ func checkHealth(endpoint string) (*HealthResponse, error) {
 	return &healthResp, nil
 }
 
+func monitorMetricRecovery(metricConfig *MetricConfig, metricItem *MetricItem, bot *tgbotapi.BotAPI, chatID int64) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			value, err := getMetricValue(metricConfig.RESTEndpoint, metricItem.Metric)
+			if err != nil {
+				fmt.Printf("[Recovery Monitor] Error getting metric %s: %v\n", metricItem.Metric, err)
+				continue
+			}
+
+			// Check if metric has recovered (below threshold)
+			if value < float64(metricItem.Threshold) {
+				metricItem.recoveryMonitorMu.Lock()
+				if metricItem.isUnhealthy {
+					// Metric has recovered
+					metricItem.isUnhealthy = false
+
+					displayName := metricItem.Metric
+					if metricItem.Name != "" {
+						displayName = metricItem.Name
+					}
+
+					stdoutMsg := fmt.Sprintf("[%s] %s (%s) has recovered! Current value: %.2f (Threshold: %d)",
+						metricConfig.Name, displayName, metricItem.Metric, value, metricItem.Threshold)
+
+					telegramMsg := fmt.Sprintf("✅ Recovery: [%s] %s `%s` has recovered!\nCurrent value: %.2f\nThreshold: %d",
+						metricConfig.Name, displayName, metricItem.Metric, value, metricItem.Threshold)
+
+					fmt.Println(telegramMsg)
+
+					if bot != nil {
+						tgMsg := tgbotapi.NewMessage(chatID, telegramMsg)
+						tgMsg.ParseMode = tgbotapi.ModeMarkdown
+						_, err := bot.Send(tgMsg)
+						if err != nil {
+							fmt.Printf("Error sending Telegram recovery message: %v\n", err)
+						}
+					} else {
+						fmt.Println(stdoutMsg)
+					}
+
+					// Stop the recovery monitor
+					metricItem.recoveryMonitorMu.Unlock()
+					return
+				}
+				metricItem.recoveryMonitorMu.Unlock()
+			}
+		case <-metricItem.recoveryMonitorStop:
+			return
+		}
+	}
+}
+
 func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int64, interval time.Duration, globalCooldown int, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -281,6 +430,15 @@ func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int6
 				}
 
 				metricItem.lastAlertTime = time.Now()
+
+				// Start recovery monitoring if not already started
+				metricItem.recoveryMonitorMu.Lock()
+				if !metricItem.isUnhealthy {
+					metricItem.isUnhealthy = true
+					metricItem.recoveryMonitorStop = make(chan bool)
+					go monitorMetricRecovery(metricConfig, metricItem, bot, chatID)
+				}
+				metricItem.recoveryMonitorMu.Unlock()
 			}
 		}
 	}
@@ -329,6 +487,15 @@ func monitorMetric(metricConfig *MetricConfig, bot *tgbotapi.BotAPI, chatID int6
 
 						metricItem.lastAlertTime = time.Now()
 					}
+
+					// Start recovery monitoring if not already started
+					metricItem.recoveryMonitorMu.Lock()
+					if !metricItem.isUnhealthy {
+						metricItem.isUnhealthy = true
+						metricItem.recoveryMonitorStop = make(chan bool)
+						go monitorMetricRecovery(metricConfig, metricItem, bot, chatID)
+					}
+					metricItem.recoveryMonitorMu.Unlock()
 				}
 			}
 		}
@@ -427,6 +594,53 @@ func checkAndNotify(addrGroupConfig *AddressConfig, addrItem *AddressItem, bot *
 	return fmt.Errorf("denomination %s not found in balances for %s", addrItem.Threshold.Denom, addrItem.Name)
 }
 
+func monitorHealthRecovery(healthConfig *HealthConfig, healthItem *HealthItem, bot *tgbotapi.BotAPI, chatID int64) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			healthResp, err := checkHealth(healthItem.Endpoint)
+
+			// Check if health has recovered (no error and isHealthy is true)
+			if err == nil && healthResp.Result.IsHealthy {
+				healthItem.recoveryMonitorMu.Lock()
+				if healthItem.isUnhealthy {
+					// Health has recovered
+					healthItem.isUnhealthy = false
+
+					stdoutMsg := fmt.Sprintf("[%s] %s has recovered! Health is now: %v",
+						healthConfig.Name, healthItem.Name, healthResp.Result.IsHealthy)
+
+					telegramMsg := fmt.Sprintf("✅ Recovery: [%s] `%s` has recovered!\nEndpoint: `%s`\nHealth is now: %v",
+						healthConfig.Name, healthItem.Name, healthItem.Endpoint, healthResp.Result.IsHealthy)
+
+					fmt.Println(telegramMsg)
+
+					if bot != nil {
+						tgMsg := tgbotapi.NewMessage(chatID, telegramMsg)
+						tgMsg.ParseMode = tgbotapi.ModeMarkdown
+						_, sendErr := bot.Send(tgMsg)
+						if sendErr != nil {
+							fmt.Printf("Error sending Telegram recovery message: %v\n", sendErr)
+						}
+					} else {
+						fmt.Println(stdoutMsg)
+					}
+
+					// Stop the recovery monitor
+					healthItem.recoveryMonitorMu.Unlock()
+					return
+				}
+				healthItem.recoveryMonitorMu.Unlock()
+			}
+		case <-healthItem.recoveryMonitorStop:
+			return
+		}
+	}
+}
+
 func checkAndNotifyHealth(healthConfig *HealthConfig, healthItem *HealthItem, bot *tgbotapi.BotAPI, chatID int64, globalCooldown int) error {
 	healthResp, err := checkHealth(healthItem.Endpoint)
 	if err != nil {
@@ -470,6 +684,16 @@ func checkAndNotifyHealth(healthConfig *HealthConfig, healthItem *HealthItem, bo
 
 		// Update last alert time
 		healthItem.lastAlertTime = time.Now()
+
+		// Start recovery monitoring if not already started
+		healthItem.recoveryMonitorMu.Lock()
+		if !healthItem.isUnhealthy {
+			healthItem.isUnhealthy = true
+			healthItem.recoveryMonitorStop = make(chan bool)
+			go monitorHealthRecovery(healthConfig, healthItem, bot, chatID)
+		}
+		healthItem.recoveryMonitorMu.Unlock()
+
 		return nil
 	}
 
@@ -526,9 +750,121 @@ func checkAndNotifyHealth(healthConfig *HealthConfig, healthItem *HealthItem, bo
 
 		// Update last alert time
 		healthItem.lastAlertTime = time.Now()
+
+		// Start recovery monitoring if not already started
+		healthItem.recoveryMonitorMu.Lock()
+		if !healthItem.isUnhealthy {
+			healthItem.isUnhealthy = true
+			healthItem.recoveryMonitorStop = make(chan bool)
+			go monitorHealthRecovery(healthConfig, healthItem, bot, chatID)
+		}
+		healthItem.recoveryMonitorMu.Unlock()
 	}
 
 	return nil
+}
+
+func checkAndNotifyKaspa(kaspaGroupConfig *KaspaAddressConfig, kaspaItem *KaspaAddressItem, bot *tgbotapi.BotAPI, chatID int64, globalCooldown int) error {
+	balanceResp, err := getKaspaBalance(kaspaGroupConfig.RESTEndpoint, kaspaItem.Address)
+	if err != nil {
+		return fmt.Errorf("error checking %s: %w", kaspaItem.Name, err)
+	}
+
+	thresholdAmount := new(big.Int)
+	_, ok := thresholdAmount.SetString(kaspaItem.Threshold, 10)
+	if !ok {
+		return fmt.Errorf("invalid threshold amount for %s: %s", kaspaItem.Name, kaspaItem.Threshold)
+	}
+
+	currentAmount := big.NewInt(balanceResp.Balance)
+
+	// Always print to stdout
+	fmt.Printf("[%s] %s Kaspa Balance: %d sompi (Threshold: %s sompi)\n",
+		kaspaGroupConfig.Name,
+		kaspaItem.Name,
+		balanceResp.Balance,
+		kaspaItem.Threshold)
+
+	if currentAmount.Cmp(thresholdAmount) < 0 {
+		// Check if we're still in cooldown period
+		cooldown := globalCooldown
+		if kaspaItem.AlertCooldown > 0 {
+			cooldown = kaspaItem.AlertCooldown
+		}
+
+		if !kaspaItem.lastAlertTime.IsZero() {
+			timeSinceLastAlert := time.Since(kaspaItem.lastAlertTime)
+			if timeSinceLastAlert < time.Duration(cooldown)*time.Second {
+				// Still in cooldown, just log to stdout
+				fmt.Printf("[%s] %s Kaspa balance still below threshold, but in alert cooldown (%s remaining)\n",
+					kaspaGroupConfig.Name,
+					kaspaItem.Name,
+					time.Duration(cooldown)*time.Second-timeSinceLastAlert)
+				return nil
+			}
+		}
+
+		// Format for stdout
+		stdoutMsg := fmt.Sprintf("[%s] %s Kaspa balance is below threshold! Expected: %s sompi, Actual: %d sompi",
+			kaspaGroupConfig.Name,
+			kaspaItem.Name,
+			kaspaItem.Threshold,
+			balanceResp.Balance)
+
+		// Format for Telegram with markdown
+		telegramMsg := fmt.Sprintf("📉 Alert: [%s] `%s` Kaspa balance is below threshold!\nAddress: `%s`\nCurrent balance: %d sompi\nThreshold: %s sompi",
+			kaspaGroupConfig.Name,
+			kaspaItem.Name,
+			kaspaItem.Address,
+			balanceResp.Balance,
+			kaspaItem.Threshold)
+
+		fmt.Println(telegramMsg)
+
+		// Only send Telegram message if bot is configured
+		if bot != nil {
+			msg := tgbotapi.NewMessage(chatID, telegramMsg)
+			msg.ParseMode = tgbotapi.ModeMarkdown
+			if _, err := bot.Send(msg); err != nil {
+				// Log the Telegram error but don't stop monitoring
+				fmt.Printf("Warning: Failed to send Telegram message: %v\n", err)
+			}
+		}
+		// Always print to stdout
+		fmt.Println(stdoutMsg)
+
+		// Update last alert time
+		kaspaItem.lastAlertTime = time.Now()
+	}
+
+	return nil
+}
+
+func monitorKaspaAddressGroup(kaspaGroupConfig *KaspaAddressConfig, bot *tgbotapi.BotAPI, chatID int64, interval time.Duration, globalCooldown int, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	fmt.Printf("Started monitoring Kaspa address group '%s' with %d addresses\n",
+		kaspaGroupConfig.Name, len(kaspaGroupConfig.Addresses))
+
+	// Initial check for each address
+	for i := range kaspaGroupConfig.Addresses {
+		kaspaItem := &kaspaGroupConfig.Addresses[i]
+		if err := checkAndNotifyKaspa(kaspaGroupConfig, kaspaItem, bot, chatID, globalCooldown); err != nil {
+			fmt.Printf("Error checking %s: %v\n", kaspaItem.Name, err)
+		}
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		for i := range kaspaGroupConfig.Addresses {
+			kaspaItem := &kaspaGroupConfig.Addresses[i]
+			if err := checkAndNotifyKaspa(kaspaGroupConfig, kaspaItem, bot, chatID, globalCooldown); err != nil {
+				fmt.Printf("Error checking %s: %v\n", kaspaItem.Name, err)
+			}
+		}
+	}
 }
 
 func monitorAddressGroup(addrGroupConfig *AddressConfig, bot *tgbotapi.BotAPI, chatID int64, interval time.Duration, globalCooldown int, wg *sync.WaitGroup) {
@@ -645,6 +981,18 @@ func main() {
 		}
 	}
 
+	// Only show Kaspa addresses section if we have Kaspa addresses to monitor
+	if len(config.KaspaAddresses) > 0 {
+		fmt.Println("\nMonitoring Kaspa addresses:")
+		for _, kaspaGroup := range config.KaspaAddresses {
+			fmt.Printf("- %s (endpoint: %s)\n", kaspaGroup.Name, kaspaGroup.RESTEndpoint)
+			for _, addr := range kaspaGroup.Addresses {
+				fmt.Printf("  • %s (%s), threshold: %s sompi\n",
+					addr.Name, addr.Address, addr.Threshold)
+			}
+		}
+	}
+
 	// Only show metrics section if we have metrics to monitor
 	if len(config.Metrics) > 0 {
 		fmt.Println("\nMonitoring metrics:")
@@ -672,8 +1020,8 @@ func main() {
 	}
 
 	// Exit if there's nothing to monitor
-	if len(config.Addresses) == 0 && len(config.Metrics) == 0 && len(config.Health) == 0 {
-		fmt.Println("\nError: No addresses, metrics, or health endpoints configured to monitor. Please add at least one address, metric, or health endpoint to your config.")
+	if len(config.Addresses) == 0 && len(config.KaspaAddresses) == 0 && len(config.Metrics) == 0 && len(config.Health) == 0 {
+		fmt.Println("\nError: No addresses, Kaspa addresses, metrics, or health endpoints configured to monitor. Please add at least one address, Kaspa address, metric, or health endpoint to your config.")
 		os.Exit(1)
 	}
 
@@ -691,6 +1039,13 @@ func main() {
 		wg.Add(1)
 		// Pass pointer to address group config to allow updating lastAlertTime for each address
 		go monitorAddressGroup(&config.Addresses[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
+	}
+
+	// Start monitoring each Kaspa address group in parallel
+	for i := range config.KaspaAddresses {
+		wg.Add(1)
+		// Pass pointer to Kaspa address group config to allow updating lastAlertTime for each address
+		go monitorKaspaAddressGroup(&config.KaspaAddresses[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
 	}
 
 	// Start monitoring health groups in parallel
