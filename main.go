@@ -93,14 +93,31 @@ type HealthConfig struct {
 	Endpoints []HealthItem `mapstructure:"endpoints"`
 }
 
+type KaspaValidatorItem struct {
+	Name          string `mapstructure:"name"`
+	Endpoint      string `mapstructure:"endpoint"`
+	AlertCooldown int    `mapstructure:"alert_cooldown"` // Optional per-validator cooldown
+
+	lastAlertTime       time.Time   // Internal tracking, not from config
+	isUnhealthy         bool        // Track if currently in unhealthy state
+	recoveryMonitorStop chan bool   // Channel to stop recovery monitoring
+	recoveryMonitorMu   *sync.Mutex // Pointer to avoid copy issues
+}
+
+type KaspaValidatorConfig struct {
+	Name       string               `mapstructure:"name"`
+	Validators []KaspaValidatorItem `mapstructure:"validators"`
+}
+
 type Config struct {
-	CheckInterval  int                   `mapstructure:"check_interval"`
-	AlertCooldown  int                   `mapstructure:"alert_cooldown"` // Global cooldown setting
-	Metrics        []MetricConfig        `mapstructure:"metrics"`
-	Addresses      []AddressConfig       `mapstructure:"addresses"`
-	KaspaAddresses []KaspaAddressConfig  `mapstructure:"kaspa_addresses"`
-	Health         []HealthConfig        `mapstructure:"health"`
-	Telegram       struct {
+	CheckInterval   int                    `mapstructure:"check_interval"`
+	AlertCooldown   int                    `mapstructure:"alert_cooldown"` // Global cooldown setting
+	Metrics         []MetricConfig         `mapstructure:"metrics"`
+	Addresses       []AddressConfig        `mapstructure:"addresses"`
+	KaspaAddresses  []KaspaAddressConfig   `mapstructure:"kaspa_addresses"`
+	KaspaValidators []KaspaValidatorConfig `mapstructure:"kaspa_validators"`
+	Health          []HealthConfig         `mapstructure:"health"`
+	Telegram        struct {
 		BotToken string `mapstructure:"bot_token"`
 		ChatID   int64  `mapstructure:"chat_id"`
 	} `mapstructure:"telegram"`
@@ -221,6 +238,25 @@ func loadConfig(configPath string) (*Config, error) {
 		}
 	}
 
+	// Validate each Kaspa validator configuration if any are provided
+	for i, validatorGroup := range config.KaspaValidators {
+		if validatorGroup.Name == "" {
+			config.KaspaValidators[i].Name = fmt.Sprintf("Kaspa Validator Group %d", i+1) // Set default name if not provided
+		}
+
+		// Validate each validator within the group
+		for j, validator := range validatorGroup.Validators {
+			if validator.Endpoint == "" {
+				return nil, fmt.Errorf("endpoint is required for Kaspa validator item #%d in group '%s'", j+1, validatorGroup.Name)
+			}
+			if validator.Name == "" {
+				config.KaspaValidators[i].Validators[j].Name = fmt.Sprintf("Kaspa Validator %d", j+1) // Set default name if not provided
+			}
+			// Initialize mutex for recovery monitoring
+			config.KaspaValidators[i].Validators[j].recoveryMonitorMu = &sync.Mutex{}
+		}
+	}
+
 	return &config, nil
 }
 
@@ -328,6 +364,26 @@ func checkHealth(endpoint string) (*HealthResponse, error) {
 	}
 
 	return &healthResp, nil
+}
+
+// pingKaspaValidator sends a GET request to the health endpoint and expects 200 OK
+func pingKaspaValidator(endpoint string) error {
+	resp, err := http.Get(endpoint)
+	if err != nil {
+		return fmt.Errorf("error making request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("error reading response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("validator health check returned status code %d: %s", resp.StatusCode, string(body))
+	}
+
+	return nil
 }
 
 func monitorMetricRecovery(metricConfig *MetricConfig, metricItem *MetricItem, bot *tgbotapi.BotAPI, chatID int64) {
@@ -641,6 +697,123 @@ func monitorHealthRecovery(healthConfig *HealthConfig, healthItem *HealthItem, b
 	}
 }
 
+func monitorKaspaValidatorRecovery(validatorConfig *KaspaValidatorConfig, validatorItem *KaspaValidatorItem, bot *tgbotapi.BotAPI, chatID int64) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			err := pingKaspaValidator(validatorItem.Endpoint)
+
+			// Check if validator has recovered (no error means healthy)
+			if err == nil {
+				validatorItem.recoveryMonitorMu.Lock()
+				if validatorItem.isUnhealthy {
+					// Validator has recovered
+					validatorItem.isUnhealthy = false
+
+					stdoutMsg := fmt.Sprintf("[%s] %s has recovered! Validator is now responding",
+						validatorConfig.Name, validatorItem.Name)
+
+					telegramMsg := fmt.Sprintf("✅ Recovery: [%s] `%s` has recovered!\nEndpoint: `%s`\nValidator is now responding to ping",
+						validatorConfig.Name, validatorItem.Name, validatorItem.Endpoint)
+
+					fmt.Println(telegramMsg)
+
+					if bot != nil {
+						tgMsg := tgbotapi.NewMessage(chatID, telegramMsg)
+						tgMsg.ParseMode = tgbotapi.ModeMarkdown
+						_, sendErr := bot.Send(tgMsg)
+						if sendErr != nil {
+							fmt.Printf("Error sending Telegram recovery message: %v\n", sendErr)
+						}
+					} else {
+						fmt.Println(stdoutMsg)
+					}
+
+					// Stop the recovery monitor
+					validatorItem.recoveryMonitorMu.Unlock()
+					return
+				}
+				validatorItem.recoveryMonitorMu.Unlock()
+			}
+		case <-validatorItem.recoveryMonitorStop:
+			return
+		}
+	}
+}
+
+func checkAndNotifyKaspaValidator(validatorConfig *KaspaValidatorConfig, validatorItem *KaspaValidatorItem, bot *tgbotapi.BotAPI, chatID int64, globalCooldown int) error {
+	err := pingKaspaValidator(validatorItem.Endpoint)
+	if err != nil {
+		// Check if we're still in cooldown period
+		cooldown := globalCooldown
+		if validatorItem.AlertCooldown > 0 {
+			cooldown = validatorItem.AlertCooldown
+		}
+
+		if !validatorItem.lastAlertTime.IsZero() {
+			timeSinceLastAlert := time.Since(validatorItem.lastAlertTime)
+			if timeSinceLastAlert < time.Duration(cooldown)*time.Second {
+				// Still in cooldown, just log to stdout
+				fmt.Printf("[%s] %s validator ping failed, but in alert cooldown (%s remaining)\n",
+					validatorConfig.Name,
+					validatorItem.Name,
+					time.Duration(cooldown)*time.Second-timeSinceLastAlert)
+				return nil
+			}
+		}
+
+		// Format for stdout
+		stdoutMsg := fmt.Sprintf("[%s] %s validator ping failed: %v",
+			validatorConfig.Name,
+			validatorItem.Name, err)
+
+		// Format for Telegram with markdown
+		telegramMsg := fmt.Sprintf("🚨 Alert: [%s] `%s` Kaspa validator is unavailable!\nEndpoint: `%s`\nError: %v",
+			validatorConfig.Name,
+			validatorItem.Name,
+			validatorItem.Endpoint, err)
+
+		fmt.Println(telegramMsg)
+
+		// Only send Telegram message if bot is configured
+		if bot != nil {
+			msg := tgbotapi.NewMessage(chatID, telegramMsg)
+			msg.ParseMode = tgbotapi.ModeMarkdown
+			if _, err := bot.Send(msg); err != nil {
+				// Log the Telegram error but don't stop monitoring
+				fmt.Printf("Warning: Failed to send Telegram message: %v\n", err)
+			}
+		}
+		// Always print to stdout
+		fmt.Println(stdoutMsg)
+
+		// Update last alert time
+		validatorItem.lastAlertTime = time.Now()
+
+		// Start recovery monitoring if not already started
+		validatorItem.recoveryMonitorMu.Lock()
+		if !validatorItem.isUnhealthy {
+			validatorItem.isUnhealthy = true
+			validatorItem.recoveryMonitorStop = make(chan bool)
+			go monitorKaspaValidatorRecovery(validatorConfig, validatorItem, bot, chatID)
+		}
+		validatorItem.recoveryMonitorMu.Unlock()
+
+		return nil
+	}
+
+	// Always print to stdout when healthy
+	fmt.Printf("[%s] %s Kaspa Validator: OK (Endpoint: %s)\n",
+		validatorConfig.Name,
+		validatorItem.Name,
+		validatorItem.Endpoint)
+
+	return nil
+}
+
 func checkAndNotifyHealth(healthConfig *HealthConfig, healthItem *HealthItem, bot *tgbotapi.BotAPI, chatID int64, globalCooldown int) error {
 	healthResp, err := checkHealth(healthItem.Endpoint)
 	if err != nil {
@@ -894,6 +1067,33 @@ func monitorAddressGroup(addrGroupConfig *AddressConfig, bot *tgbotapi.BotAPI, c
 	}
 }
 
+func monitorKaspaValidators(validatorConfig *KaspaValidatorConfig, bot *tgbotapi.BotAPI, chatID int64, interval time.Duration, globalCooldown int, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	fmt.Printf("Started monitoring Kaspa validator group '%s' with %d validators\n",
+		validatorConfig.Name, len(validatorConfig.Validators))
+
+	// Initial check for each validator
+	for i := range validatorConfig.Validators {
+		validatorItem := &validatorConfig.Validators[i]
+		if err := checkAndNotifyKaspaValidator(validatorConfig, validatorItem, bot, chatID, globalCooldown); err != nil {
+			fmt.Printf("Error checking Kaspa validator %s: %v\n", validatorItem.Name, err)
+		}
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		for i := range validatorConfig.Validators {
+			validatorItem := &validatorConfig.Validators[i]
+			if err := checkAndNotifyKaspaValidator(validatorConfig, validatorItem, bot, chatID, globalCooldown); err != nil {
+				fmt.Printf("Error checking Kaspa validator %s: %v\n", validatorItem.Name, err)
+			}
+		}
+	}
+}
+
 func monitorHealth(healthConfig *HealthConfig, bot *tgbotapi.BotAPI, chatID int64, interval time.Duration, globalCooldown int, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -1019,9 +1219,20 @@ func main() {
 		}
 	}
 
+	// Only show Kaspa validators section if we have validators to monitor
+	if len(config.KaspaValidators) > 0 {
+		fmt.Println("\nMonitoring Kaspa validators:")
+		for _, validatorGroup := range config.KaspaValidators {
+			fmt.Printf("- %s\n", validatorGroup.Name)
+			for _, validator := range validatorGroup.Validators {
+				fmt.Printf("  • %s (%s)\n", validator.Name, validator.Endpoint)
+			}
+		}
+	}
+
 	// Exit if there's nothing to monitor
-	if len(config.Addresses) == 0 && len(config.KaspaAddresses) == 0 && len(config.Metrics) == 0 && len(config.Health) == 0 {
-		fmt.Println("\nError: No addresses, Kaspa addresses, metrics, or health endpoints configured to monitor. Please add at least one address, Kaspa address, metric, or health endpoint to your config.")
+	if len(config.Addresses) == 0 && len(config.KaspaAddresses) == 0 && len(config.Metrics) == 0 && len(config.Health) == 0 && len(config.KaspaValidators) == 0 {
+		fmt.Println("\nError: No addresses, Kaspa addresses, metrics, health endpoints, or Kaspa validators configured to monitor. Please add at least one to your config.")
 		os.Exit(1)
 	}
 
@@ -1053,6 +1264,13 @@ func main() {
 		wg.Add(1)
 		// Pass pointer to health group config to allow updating lastAlertTime for each health item
 		go monitorHealth(&config.Health[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
+	}
+
+	// Start monitoring Kaspa validator groups in parallel
+	for i := range config.KaspaValidators {
+		wg.Add(1)
+		// Pass pointer to Kaspa validator group config to allow updating lastAlertTime for each validator
+		go monitorKaspaValidators(&config.KaspaValidators[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
 	}
 
 	// Wait for all monitoring goroutines
