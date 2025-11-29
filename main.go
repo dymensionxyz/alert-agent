@@ -104,6 +104,8 @@ type KaspaValidatorItem struct {
 
 	lastAlertTime       time.Time   // Internal tracking, not from config
 	isUnhealthy         bool        // Track if currently in unhealthy state
+	unhealthySince      time.Time   // When the validator first became unhealthy
+	alertSent           bool        // Whether alert has been sent for current unhealthy period
 	recoveryMonitorStop chan bool   // Channel to stop recovery monitoring
 	recoveryMonitorMu   *sync.Mutex // Pointer to avoid copy issues
 }
@@ -111,6 +113,7 @@ type KaspaValidatorItem struct {
 type KaspaValidatorConfig struct {
 	Name          string               `mapstructure:"name"`
 	CheckInterval int                  `mapstructure:"check_interval"` // Optional per-group check interval
+	AlertDelay    int                  `mapstructure:"alert_delay"`    // Seconds validator must be unhealthy before alerting
 	Validators    []KaspaValidatorItem `mapstructure:"validators"`
 }
 
@@ -717,24 +720,33 @@ func monitorKaspaValidatorRecovery(validatorConfig *KaspaValidatorConfig, valida
 				if validatorItem.isUnhealthy {
 					// Validator has recovered
 					validatorItem.isUnhealthy = false
+					validatorItem.unhealthySince = time.Time{} // Reset unhealthy tracking
+					alertWasSent := validatorItem.alertSent
+					validatorItem.alertSent = false
 
-					stdoutMsg := fmt.Sprintf("[%s] %s has recovered! Validator is now responding",
-						validatorConfig.Name, validatorItem.Name)
+					// Only send recovery message if an alert was previously sent
+					if alertWasSent {
+						stdoutMsg := fmt.Sprintf("[%s] %s has recovered! Validator is now responding",
+							validatorConfig.Name, validatorItem.Name)
 
-					telegramMsg := fmt.Sprintf("✅ Recovery: [%s] `%s` has recovered!\nEndpoint: `%s`",
-						validatorConfig.Name, validatorItem.Name, validatorItem.Endpoint)
+						telegramMsg := fmt.Sprintf("✅ Recovery: [%s] `%s` has recovered!\nEndpoint: `%s`",
+							validatorConfig.Name, validatorItem.Name, validatorItem.Endpoint)
 
-					fmt.Println(telegramMsg)
+						fmt.Println(telegramMsg)
 
-					if bot != nil {
-						tgMsg := tgbotapi.NewMessage(chatID, telegramMsg)
-						tgMsg.ParseMode = tgbotapi.ModeMarkdown
-						_, sendErr := bot.Send(tgMsg)
-						if sendErr != nil {
-							fmt.Printf("Error sending Telegram recovery message: %v\n", sendErr)
+						if bot != nil {
+							tgMsg := tgbotapi.NewMessage(chatID, telegramMsg)
+							tgMsg.ParseMode = tgbotapi.ModeMarkdown
+							_, sendErr := bot.Send(tgMsg)
+							if sendErr != nil {
+								fmt.Printf("Error sending Telegram recovery message: %v\n", sendErr)
+							}
+						} else {
+							fmt.Println(stdoutMsg)
 						}
 					} else {
-						fmt.Println(stdoutMsg)
+						fmt.Printf("[%s] %s recovered before alert delay threshold\n",
+							validatorConfig.Name, validatorItem.Name)
 					}
 
 					// Stop the recovery monitor
@@ -752,13 +764,46 @@ func monitorKaspaValidatorRecovery(validatorConfig *KaspaValidatorConfig, valida
 func checkAndNotifyKaspaValidator(validatorConfig *KaspaValidatorConfig, validatorItem *KaspaValidatorItem, bot *tgbotapi.BotAPI, chatID int64, globalCooldown int) error {
 	err := pingKaspaValidator(validatorItem.Endpoint)
 	if err != nil {
-		// Check if we're still in cooldown period
+		validatorItem.recoveryMonitorMu.Lock()
+
+		// Track when validator first became unhealthy
+		if validatorItem.unhealthySince.IsZero() {
+			validatorItem.unhealthySince = time.Now()
+			fmt.Printf("[%s] %s validator ping failed, starting alert delay timer: %v\n",
+				validatorConfig.Name,
+				validatorItem.Name, err)
+		}
+
+		// Check if alert delay has passed
+		alertDelay := time.Duration(validatorConfig.AlertDelay) * time.Second
+		unhealthyDuration := time.Since(validatorItem.unhealthySince)
+
+		if alertDelay > 0 && unhealthyDuration < alertDelay {
+			// Still within alert delay period, don't send alert yet
+			fmt.Printf("[%s] %s validator ping failed, waiting for alert delay (%s remaining): %v\n",
+				validatorConfig.Name,
+				validatorItem.Name,
+				alertDelay-unhealthyDuration,
+				err)
+
+			// Start recovery monitoring if not already started
+			if !validatorItem.isUnhealthy {
+				validatorItem.isUnhealthy = true
+				validatorItem.recoveryMonitorStop = make(chan bool)
+				go monitorKaspaValidatorRecovery(validatorConfig, validatorItem, bot, chatID)
+			}
+			validatorItem.recoveryMonitorMu.Unlock()
+			return nil
+		}
+
+		// Alert delay has passed (or no delay configured), check cooldown
 		cooldown := globalCooldown
 		if validatorItem.AlertCooldown > 0 {
 			cooldown = validatorItem.AlertCooldown
 		}
 
-		if !validatorItem.lastAlertTime.IsZero() {
+		// Check if we already sent an alert and are in cooldown
+		if validatorItem.alertSent && !validatorItem.lastAlertTime.IsZero() {
 			timeSinceLastAlert := time.Since(validatorItem.lastAlertTime)
 			if timeSinceLastAlert < time.Duration(cooldown)*time.Second {
 				// Still in cooldown, just log to stdout
@@ -766,20 +811,32 @@ func checkAndNotifyKaspaValidator(validatorConfig *KaspaValidatorConfig, validat
 					validatorConfig.Name,
 					validatorItem.Name,
 					time.Duration(cooldown)*time.Second-timeSinceLastAlert)
+
+				// Start recovery monitoring if not already started
+				if !validatorItem.isUnhealthy {
+					validatorItem.isUnhealthy = true
+					validatorItem.recoveryMonitorStop = make(chan bool)
+					go monitorKaspaValidatorRecovery(validatorConfig, validatorItem, bot, chatID)
+				}
+				validatorItem.recoveryMonitorMu.Unlock()
 				return nil
 			}
 		}
 
 		// Format for stdout
-		stdoutMsg := fmt.Sprintf("[%s] %s validator ping failed: %v",
-			validatorConfig.Name,
-			validatorItem.Name, err)
-
-		// Format for Telegram with markdown
-		telegramMsg := fmt.Sprintf("🚨 Alert: [%s] `%s` Kaspa validator is unavailable!\nEndpoint: `%s`\nError: %v",
+		stdoutMsg := fmt.Sprintf("[%s] %s validator ping failed (unhealthy for %s): %v",
 			validatorConfig.Name,
 			validatorItem.Name,
-			validatorItem.Endpoint, err)
+			unhealthyDuration.Round(time.Second),
+			err)
+
+		// Format for Telegram with markdown
+		telegramMsg := fmt.Sprintf("🚨 Alert: [%s] `%s` validator is unavailable!\nEndpoint: `%s`\nUnhealthy for: %s\nError: %v",
+			validatorConfig.Name,
+			validatorItem.Name,
+			validatorItem.Endpoint,
+			unhealthyDuration.Round(time.Second),
+			err)
 
 		fmt.Println(telegramMsg)
 
@@ -795,11 +852,11 @@ func checkAndNotifyKaspaValidator(validatorConfig *KaspaValidatorConfig, validat
 		// Always print to stdout
 		fmt.Println(stdoutMsg)
 
-		// Update last alert time
+		// Update last alert time and mark alert as sent
 		validatorItem.lastAlertTime = time.Now()
+		validatorItem.alertSent = true
 
 		// Start recovery monitoring if not already started
-		validatorItem.recoveryMonitorMu.Lock()
 		if !validatorItem.isUnhealthy {
 			validatorItem.isUnhealthy = true
 			validatorItem.recoveryMonitorStop = make(chan bool)
@@ -810,8 +867,16 @@ func checkAndNotifyKaspaValidator(validatorConfig *KaspaValidatorConfig, validat
 		return nil
 	}
 
+	// Validator is healthy - reset unhealthy tracking if it was set
+	validatorItem.recoveryMonitorMu.Lock()
+	if !validatorItem.unhealthySince.IsZero() {
+		validatorItem.unhealthySince = time.Time{}
+		validatorItem.alertSent = false
+	}
+	validatorItem.recoveryMonitorMu.Unlock()
+
 	// Always print to stdout when healthy
-	fmt.Printf("[%s] %s Kaspa Validator: OK (Endpoint: %s)\n",
+	fmt.Printf("[%s] %s Validator: OK (Endpoint: %s)\n",
 		validatorConfig.Name,
 		validatorItem.Name,
 		validatorItem.Endpoint)
