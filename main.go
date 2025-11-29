@@ -51,15 +51,17 @@ type KaspaAddressItem struct {
 }
 
 type AddressConfig struct {
-	Name         string        `mapstructure:"name"`
-	RESTEndpoint string        `mapstructure:"rest_endpoint"`
-	Addresses    []AddressItem `mapstructure:"addresses"`
+	Name          string        `mapstructure:"name"`
+	RESTEndpoint  string        `mapstructure:"rest_endpoint"`
+	CheckInterval int           `mapstructure:"check_interval"` // Optional per-group check interval
+	Addresses     []AddressItem `mapstructure:"addresses"`
 }
 
 type KaspaAddressConfig struct {
-	Name         string             `mapstructure:"name"`
-	RESTEndpoint string             `mapstructure:"rest_endpoint"`
-	Addresses    []KaspaAddressItem `mapstructure:"addresses"`
+	Name          string             `mapstructure:"name"`
+	RESTEndpoint  string             `mapstructure:"rest_endpoint"`
+	CheckInterval int                `mapstructure:"check_interval"` // Optional per-group check interval
+	Addresses     []KaspaAddressItem `mapstructure:"addresses"`
 }
 
 type MetricItem struct {
@@ -74,9 +76,10 @@ type MetricItem struct {
 }
 
 type MetricConfig struct {
-	Name         string       `mapstructure:"name"`
-	RESTEndpoint string       `mapstructure:"rest_endpoint"`
-	Metrics      []MetricItem `mapstructure:"metrics"`
+	Name          string       `mapstructure:"name"`
+	RESTEndpoint  string       `mapstructure:"rest_endpoint"`
+	CheckInterval int          `mapstructure:"check_interval"` // Optional per-group check interval
+	Metrics       []MetricItem `mapstructure:"metrics"`
 }
 
 type HealthItem struct {
@@ -89,8 +92,9 @@ type HealthItem struct {
 }
 
 type HealthConfig struct {
-	Name      string       `mapstructure:"name"`
-	Endpoints []HealthItem `mapstructure:"endpoints"`
+	Name          string       `mapstructure:"name"`
+	CheckInterval int          `mapstructure:"check_interval"` // Optional per-group check interval
+	Endpoints     []HealthItem `mapstructure:"endpoints"`
 }
 
 type KaspaValidatorItem struct {
@@ -105,8 +109,9 @@ type KaspaValidatorItem struct {
 }
 
 type KaspaValidatorConfig struct {
-	Name       string               `mapstructure:"name"`
-	Validators []KaspaValidatorItem `mapstructure:"validators"`
+	Name          string               `mapstructure:"name"`
+	CheckInterval int                  `mapstructure:"check_interval"` // Optional per-group check interval
+	Validators    []KaspaValidatorItem `mapstructure:"validators"`
 }
 
 type Config struct {
@@ -716,7 +721,7 @@ func monitorKaspaValidatorRecovery(validatorConfig *KaspaValidatorConfig, valida
 					stdoutMsg := fmt.Sprintf("[%s] %s has recovered! Validator is now responding",
 						validatorConfig.Name, validatorItem.Name)
 
-					telegramMsg := fmt.Sprintf("✅ Recovery: [%s] `%s` has recovered!\nEndpoint: `%s`\nValidator is now responding to ping",
+					telegramMsg := fmt.Sprintf("✅ Recovery: [%s] `%s` has recovered!\nEndpoint: `%s`",
 						validatorConfig.Name, validatorItem.Name, validatorItem.Endpoint)
 
 					fmt.Println(telegramMsg)
@@ -1237,39 +1242,55 @@ func main() {
 	}
 
 	var wg sync.WaitGroup
-	interval := time.Duration(config.CheckInterval) * time.Second
+	globalInterval := time.Duration(config.CheckInterval) * time.Second
 
 	// Start monitoring metrics
 	for i := range config.Metrics {
 		wg.Add(1)
+		interval := globalInterval
+		if config.Metrics[i].CheckInterval > 0 {
+			interval = time.Duration(config.Metrics[i].CheckInterval) * time.Second
+		}
 		go monitorMetric(&config.Metrics[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
 	}
 
 	// Start monitoring each address group in parallel
 	for i := range config.Addresses {
 		wg.Add(1)
-		// Pass pointer to address group config to allow updating lastAlertTime for each address
+		interval := globalInterval
+		if config.Addresses[i].CheckInterval > 0 {
+			interval = time.Duration(config.Addresses[i].CheckInterval) * time.Second
+		}
 		go monitorAddressGroup(&config.Addresses[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
 	}
 
 	// Start monitoring each Kaspa address group in parallel
 	for i := range config.KaspaAddresses {
 		wg.Add(1)
-		// Pass pointer to Kaspa address group config to allow updating lastAlertTime for each address
+		interval := globalInterval
+		if config.KaspaAddresses[i].CheckInterval > 0 {
+			interval = time.Duration(config.KaspaAddresses[i].CheckInterval) * time.Second
+		}
 		go monitorKaspaAddressGroup(&config.KaspaAddresses[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
 	}
 
 	// Start monitoring health groups in parallel
 	for i := range config.Health {
 		wg.Add(1)
-		// Pass pointer to health group config to allow updating lastAlertTime for each health item
+		interval := globalInterval
+		if config.Health[i].CheckInterval > 0 {
+			interval = time.Duration(config.Health[i].CheckInterval) * time.Second
+		}
 		go monitorHealth(&config.Health[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
 	}
 
 	// Start monitoring Kaspa validator groups in parallel
 	for i := range config.KaspaValidators {
 		wg.Add(1)
-		// Pass pointer to Kaspa validator group config to allow updating lastAlertTime for each validator
+		interval := globalInterval
+		if config.KaspaValidators[i].CheckInterval > 0 {
+			interval = time.Duration(config.KaspaValidators[i].CheckInterval) * time.Second
+		}
 		go monitorKaspaValidators(&config.KaspaValidators[i], bot, config.Telegram.ChatID, interval, config.AlertCooldown, &wg)
 	}
 
